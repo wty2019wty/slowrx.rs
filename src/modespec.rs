@@ -139,6 +139,25 @@ impl ModeSpec {
             }
         }
     }
+
+    /// Offset (seconds) from line start to the leading edge of that line's
+    /// sync pulse.
+    ///
+    /// `LineStart` modes put the sync at line start (0). Scottie's sync sits
+    /// mid-line, after the B channel, at `2·septr + 2·chan_len` (the same
+    /// offset `mode_scottie` uses for the R channel start minus sync+porch).
+    /// Used by forced-mode acquisition to anchor a decode window on line 0
+    /// rather than on the sync pulse (issue #113 follow-up).
+    #[must_use]
+    pub(crate) fn sync_lead_offset_seconds(&self) -> f64 {
+        match self.sync_position {
+            SyncPosition::LineStart => 0.0,
+            SyncPosition::Scottie => {
+                let chan_len = f64::from(self.line_pixels) * self.pixel_seconds;
+                2.0 * self.septr_seconds + 2.0 * chan_len
+            }
+        }
+    }
 }
 
 /// Look up the [`ModeSpec`] for a given 7-bit VIS code. Returns `None`
@@ -183,6 +202,39 @@ pub fn for_mode(mode: SstvMode) -> ModeSpec {
         SstvMode::Martin1 => MARTIN1,
         SstvMode::Martin2 => MARTIN2,
     }
+}
+
+/// The [`ModeSpec`] for every implemented mode, in table order.
+///
+/// Useful for tooling that needs to enumerate modes (e.g. a CLI
+/// `--list-modes`).
+#[must_use]
+pub fn all_specs() -> &'static [ModeSpec] {
+    &ALL_SPECS
+}
+
+/// Parse a mode from a user-supplied string.
+///
+/// Matches either the [`ModeSpec::short_name`] or the human-readable
+/// [`ModeSpec::name`], case-insensitively and ignoring separators, so
+/// `"pd120"`, `"PD-120"`, and `"Robot 36"` all resolve. Returns `None` when
+/// nothing matches.
+///
+/// This is the inverse of [`ModeSpec::short_name`] only for strings that
+/// spell a real mode; it is not a general grammar.
+#[must_use]
+pub fn parse_mode(input: &str) -> Option<SstvMode> {
+    let normalized = |s: &str| -> String {
+        s.chars()
+            .filter(char::is_ascii_alphanumeric)
+            .map(|c| c.to_ascii_lowercase())
+            .collect()
+    };
+    let wanted = normalized(input);
+    ALL_SPECS
+        .iter()
+        .find(|spec| normalized(spec.short_name) == wanted || normalized(spec.name) == wanted)
+        .map(|spec| spec.mode)
 }
 
 // Mode timing constants — translated row-for-row from slowrx's
@@ -446,6 +498,30 @@ mod tests {
     }
 
     #[test]
+    fn all_specs_agrees_with_lookup_and_for_mode() {
+        for spec in all_specs() {
+            assert_eq!(for_mode(spec.mode), *spec);
+            assert_eq!(lookup(spec.vis_code).map(|s| s.mode), Some(spec.mode));
+        }
+    }
+
+    #[test]
+    fn parse_mode_accepts_short_and_display_names() {
+        for spec in all_specs() {
+            assert_eq!(parse_mode(spec.short_name), Some(spec.mode));
+            assert_eq!(parse_mode(spec.name), Some(spec.mode));
+        }
+        // Case- and separator-insensitive.
+        assert_eq!(parse_mode("PD-120"), Some(SstvMode::Pd120));
+        assert_eq!(parse_mode("pd 120"), Some(SstvMode::Pd120));
+        assert_eq!(parse_mode("Robot 36"), Some(SstvMode::Robot36));
+        assert_eq!(parse_mode("scottiedx"), Some(SstvMode::ScottieDx));
+        assert_eq!(parse_mode("Scottie DX"), Some(SstvMode::ScottieDx));
+        assert_eq!(parse_mode("nonsense"), None);
+        assert_eq!(parse_mode(""), None);
+    }
+
+    #[test]
     fn pd_modes_have_zero_septr_seconds() {
         // PD-family: SeptrTime = 0e-3 (modespec.c). The field exists for
         // V2 parity (Robot/Scottie/Martin have non-zero SeptrTime); for PD
@@ -672,6 +748,41 @@ mod tests {
                 spec.skip_correction_seconds() < 0.0,
                 "{mode:?} Scottie correction should be negative"
             );
+        }
+    }
+
+    #[test]
+    fn sync_lead_offset_seconds_line_start_is_zero() {
+        for mode in [
+            SstvMode::Pd120,
+            SstvMode::Pd240,
+            SstvMode::Pd180,
+            SstvMode::Robot24,
+            SstvMode::Robot36,
+            SstvMode::Robot72,
+            SstvMode::Martin1,
+            SstvMode::Martin2,
+        ] {
+            assert_eq!(
+                for_mode(mode).sync_lead_offset_seconds(),
+                0.0,
+                "{mode:?} syncs at line start"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_lead_offset_seconds_scottie_formula() {
+        for mode in [SstvMode::Scottie1, SstvMode::Scottie2, SstvMode::ScottieDx] {
+            let spec = for_mode(mode);
+            let chan_len = f64::from(spec.line_pixels) * spec.pixel_seconds;
+            let expected = 2.0 * spec.septr_seconds + 2.0 * chan_len;
+            assert!(
+                (spec.sync_lead_offset_seconds() - expected).abs() < 1e-12,
+                "{mode:?} got {} expected {expected}",
+                spec.sync_lead_offset_seconds()
+            );
+            assert!(spec.sync_lead_offset_seconds() > 0.0);
         }
     }
 

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Force an SSTV mode, bypassing VIS detection** (issue #113).
+  `SstvDecoder::with_mode(rate, mode)` and
+  `SstvDecoder::set_forced_mode(Some(mode))` decode every image as a
+  caller-specified mode when the VIS header is missing, damaged, or
+  misdetected; `SstvDecoder::forced_mode()` reads it back. Rather than
+  chopping the stream into fixed windows, forced mode *acquires* each
+  transmission by scanning for a run of line-spaced 1200 Hz sync pulses,
+  anchors the decode window on that train's line 0, and decodes one full
+  image; leading silence/headers and arbitrarily long inter-image gaps are
+  skipped (with bounded memory), and a lone tone or non-periodic noise does
+  not fabricate an image. `find_sync`'s line-relative skip is snapped to the
+  absolute line-0 offset via the first periodic sync pulse, so a leading
+  offset longer than one line does not alias the decode by whole lines.
+  Forced mode emits no `VisDetected` event. New `modespec::parse_mode()`
+  (re-exported as `slowrx::parse_mode`) and `modespec::all_specs()`; the CLI
+  gains `--mode <MODE>` / `-m` and `--list-modes`. Non-breaking. (#113.)
+
 ### Internal
 
 - **Docs sweep** — ten audit findings, all docs-only (audit bundle

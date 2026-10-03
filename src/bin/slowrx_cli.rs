@@ -4,12 +4,18 @@
 //!
 //! ```text
 //! slowrx-cli --input recording.wav --output ./out
+//! slowrx-cli --input recording.wav --output ./out --mode pd120
+//! slowrx-cli --list-modes
 //! ```
 //!
 //! Reads the WAV at `--input`, decodes every SSTV image found, and writes
 //! one PNG per `ImageComplete` event to `<output>/img-NNN-{mode}.png`
 //! (sequence-numbered starting at 001, lowercased mode tag — matches the
 //! rtl-sdr satellite-recorder naming convention).
+//!
+//! Pass `--mode <MODE>` to force decoding as a known mode, bypassing
+//! automatic VIS header detection (issue #113). `--list-modes` prints the
+//! accepted names.
 //!
 //! Requires the `cli` feature: `cargo install --features cli`.
 
@@ -28,22 +34,48 @@ use slowrx::{SstvDecoder, SstvEvent, SstvImage};
 )]
 struct Args {
     /// Path to a mono or multi-channel WAV file containing SSTV audio.
-    #[arg(short, long, value_name = "FILE")]
-    input: PathBuf,
+    #[arg(
+        short,
+        long,
+        value_name = "FILE",
+        required_unless_present = "list_modes"
+    )]
+    input: Option<PathBuf>,
 
     /// Output directory. Created if it does not exist. PNGs are written
     /// here as `img-NNN-{mode}.png`.
-    #[arg(short, long, value_name = "DIR")]
-    output: PathBuf,
+    #[arg(
+        short,
+        long,
+        value_name = "DIR",
+        required_unless_present = "list_modes"
+    )]
+    output: Option<PathBuf>,
 
     /// Suppress per-event progress output. Errors and the final summary
     /// still go to stderr.
     #[arg(short, long)]
     quiet: bool,
+
+    /// Force decoding as MODE, bypassing automatic VIS header detection.
+    /// Accepts a short name (e.g. `pd120`, `robot36`) or display name
+    /// (e.g. `PD-120`, `Robot 36`), case-insensitively. Use `--list-modes`
+    /// to see the accepted names.
+    #[arg(short = 'm', long, value_name = "MODE")]
+    mode: Option<String>,
+
+    /// List the supported modes and exit.
+    #[arg(long)]
+    list_modes: bool,
 }
 
 fn main() -> ExitCode {
-    match run(&Args::parse()) {
+    let args = Args::parse();
+    if args.list_modes {
+        print_modes();
+        return ExitCode::SUCCESS;
+    }
+    match run(&args) {
         Ok(image_count) => {
             if image_count == 0 {
                 eprintln!("warning: no SSTV images decoded from input");
@@ -59,12 +91,29 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(args: &Args) -> Result<u32> {
-    std::fs::create_dir_all(&args.output)
-        .with_context(|| format!("create output dir {}", args.output.display()))?;
+/// Print every supported mode as `short_name  display_name`.
+fn print_modes() {
+    for spec in slowrx::all_specs() {
+        println!("{:<10} {}", spec.short_name, spec.name);
+    }
+}
 
-    let mut reader = hound::WavReader::open(&args.input)
-        .with_context(|| format!("open WAV {}", args.input.display()))?;
+#[allow(clippy::too_many_lines)]
+fn run(args: &Args) -> Result<u32> {
+    let input = args
+        .input
+        .as_deref()
+        .ok_or_else(|| anyhow!("--input <FILE> is required"))?;
+    let output = args
+        .output
+        .as_deref()
+        .ok_or_else(|| anyhow!("--output <DIR> is required"))?;
+
+    std::fs::create_dir_all(output)
+        .with_context(|| format!("create output dir {}", output.display()))?;
+
+    let mut reader =
+        hound::WavReader::open(input).with_context(|| format!("open WAV {}", input.display()))?;
     let spec = reader.spec();
     if !args.quiet {
         eprintln!(
@@ -76,8 +125,25 @@ fn run(args: &Args) -> Result<u32> {
         );
     }
 
-    let mut decoder =
-        SstvDecoder::new(spec.sample_rate).with_context(|| "construct SstvDecoder")?;
+    let forced_mode = match args.mode.as_deref() {
+        Some(input) => Some(slowrx::parse_mode(input).ok_or_else(|| {
+            anyhow!("unknown mode {input:?}; run --list-modes to see the accepted names")
+        })?),
+        None => None,
+    };
+    let mut decoder = match forced_mode {
+        Some(mode) => SstvDecoder::with_mode(spec.sample_rate, mode)
+            .with_context(|| "construct forced-mode SstvDecoder")?,
+        None => SstvDecoder::new(spec.sample_rate).with_context(|| "construct SstvDecoder")?,
+    };
+    if let Some(mode) = forced_mode {
+        if !args.quiet {
+            eprintln!(
+                "forced mode: {} (VIS detection bypassed, issue #113)",
+                slowrx::for_mode(mode).name
+            );
+        }
+    }
 
     // Streaming pipeline: read in fixed-size chunks, normalize + fold to
     // mono on the fly, push each mono chunk into the stateful decoder.
@@ -127,7 +193,7 @@ fn run(args: &Args) -> Result<u32> {
             }
             SstvEvent::ImageComplete { image, .. } => {
                 image_count += 1;
-                let path = args.output.join(format!(
+                let path = output.join(format!(
                     "img-{image_count:03}-{}.png",
                     slowrx::modespec::for_mode(image.mode).short_name
                 ));
