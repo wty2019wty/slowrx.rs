@@ -141,7 +141,7 @@ assert!(decoder.decode_window().is_none());
 2. **限制锚点之后的喂入总量**为一个硬上限
    （`manual_feed_budget` = `MANUAL_VIS_PROBE_SECONDS` + 标称图像时长 + 尾部余量）。
 
-第 2 步用于约束搜索范围：若锚点给错，解码器不会一路扫到后面另一张图上。
+第 2 步用于给窗口封顶：若锚点给错，解码器也不会一路扫到后面另一张图上。
 
 ### 4.2 状态机
 

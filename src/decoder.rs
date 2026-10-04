@@ -9,6 +9,11 @@
 //! final `ImageComplete`. Multi-image streaming is supported in one
 //! `process()` call (issue #90).
 //!
+//! Forced mode ([`SstvDecoder::with_mode`]) bypasses VIS mode detection and
+//! decodes exactly one image located by a caller-supplied [`DecodeWindow`]
+//! (issue #114): the anchor is authoritative, absorbing a VIS header if one
+//! begins there, and there is no search for where the image starts.
+//!
 //! Translated in spirit from slowrx's `slowrx.c::Listen()` loop +
 //! `vis.c::GetVIS()` + `video.c::GetVideo()`. ISC License — see
 //! `NOTICE.md`. Inline `// slowrx <file>.c:NNN` references throughout
@@ -136,10 +141,9 @@ impl DecodeWindow {
     }
 
     /// Anchor on the last sample of the image *data* (the VIS header is not
-    /// counted). The start is derived from the mode's nominal image duration,
-    /// then refined by periodic sync-train acquisition; as with any
-    /// nominal-timing anchor, a transmitter clock error larger than about one
-    /// line can shift the top rows.
+    /// counted). The start is derived from the mode's nominal image duration;
+    /// as with any nominal-timing anchor, a transmitter clock error larger
+    /// than about one line can shift the top rows.
     #[must_use]
     pub fn ending_at(end_secs: f64) -> Self {
         Self {
@@ -370,8 +374,8 @@ pub struct SstvDecoder {
     /// Input-rate samples still to discard before feeding the resampler;
     /// positions the manual window's anchor.
     manual_skip_input: u64,
-    /// Maximum number of input-rate samples to feed after the anchor. Bounds
-    /// the manual search so a wrong anchor cannot drift onto a later image.
+    /// Maximum number of input-rate samples to feed after the anchor. Caps the
+    /// window so a wrong anchor cannot drift onto a later image.
     manual_feed_budget: Option<u64>,
 }
 
