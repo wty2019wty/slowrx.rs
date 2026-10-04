@@ -9,22 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Force an SSTV mode, bypassing VIS detection** (issue #113).
-  `SstvDecoder::with_mode(rate, mode)` and
-  `SstvDecoder::set_forced_mode(Some(mode))` decode every image as a
-  caller-specified mode when the VIS header is missing, damaged, or
-  misdetected; `SstvDecoder::forced_mode()` reads it back. Rather than
-  chopping the stream into fixed windows, forced mode *acquires* each
-  transmission by scanning for a run of line-spaced 1200 Hz sync pulses,
-  anchors the decode window on that train's line 0, and decodes one full
-  image; leading silence/headers and arbitrarily long inter-image gaps are
-  skipped (with bounded memory), and a lone tone or non-periodic noise does
-  not fabricate an image. `find_sync`'s line-relative skip is snapped to the
-  absolute line-0 offset via the first periodic sync pulse, so a leading
-  offset longer than one line does not alias the decode by whole lines.
-  Forced mode emits no `VisDetected` event. New `modespec::parse_mode()`
-  (re-exported as `slowrx::parse_mode`) and `modespec::all_specs()`; the CLI
-  gains `--mode <MODE>` / `-m` and `--list-modes`. Non-breaking. (#113.)
+- **Forced-mode decoding with a manual window** (issues #113/#114).
+  `SstvDecoder::with_mode(rate, mode, window)` /
+  `SstvDecoder::set_forced_mode(mode, window)` decode **one**
+  image as a caller-specified mode, bypassing VIS mode detection;
+  `SstvDecoder::clear_forced_mode()` restores automatic VIS detection, and
+  `forced_mode()` / `decode_window()` read the state back. A forced mode
+  **always** carries a `DecodeWindow` — there is no mode-only whole-stream
+  scan. `DecodeWindow::starting_at(secs)` anchors on the image's first line
+  *or* the transmission start (a VIS header beginning at the anchor is
+  detected and absorbed, so a Robot 36's last ~0.9 s is not cut off);
+  `DecodeWindow::ending_at(secs)` anchors on the image-data end and derives
+  the start from the mode's nominal image duration (VIS not counted). When no
+  VIS header is present the anchor itself is taken as line 0 — the decoder
+  does not search for where the image begins. The window's sync gate is
+  preserved (no sync → no image), and decoding stops after the one image.
+  Forced mode emits no `VisDetected` event. New
+  `modespec::parse_mode()` (re-exported as `slowrx::parse_mode`) and
+  `modespec::all_specs()`; the CLI gains `--mode <MODE>` / `-m` (which
+  requires `--start` or `--end`), `--start <SECONDS>` / `--end <SECONDS>`,
+  and `--list-modes`. (#113, #114.)
 
 ### Internal
 

@@ -19,7 +19,7 @@ use crate::error::Result;
 use crate::image::SstvImage;
 use crate::modespec::SstvMode;
 use crate::resample::Resampler;
-use crate::sync::{find_sync, periodic_train_start, SyncTracker, SYNC_PROBE_STRIDE};
+use crate::sync::{find_sync, SyncTracker, SYNC_PROBE_STRIDE};
 
 /// One observable event emitted by [`SstvDecoder::process`].
 #[derive(Clone, Debug, PartialEq)]
@@ -96,6 +96,59 @@ pub enum SstvEvent {
     },
 }
 
+/// A caller-specified decode window for forced-mode decoding (issue #114).
+///
+/// Times are in **seconds from the first sample fed to the decoder** (the
+/// input recording timeline). Only one endpoint is required: the decode
+/// length is the mode's nominal image duration, so the other endpoint is
+/// derived automatically.
+///
+/// * [`DecodeWindow::starting_at`] — the anchor points at the image's first
+///   line, or at the transmission start just before an optional VIS header.
+///   The decoder absorbs a VIS header when one begins at the anchor;
+///   otherwise the anchor itself is taken as line 0.
+/// * [`DecodeWindow::ending_at`] — the anchor points at the last sample of
+///   the image *data*; the start is `end − nominal image duration`.
+///
+/// A forced mode **always** carries a window (issue #114 follow-up): use
+/// [`SstvDecoder::with_mode`] or
+/// [`SstvDecoder::set_forced_mode`]. There is no mode-only
+/// (whole-stream scan) entry point.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DecodeWindow {
+    /// Image/transmission start in seconds, if the caller anchored on the
+    /// start side.
+    pub start_secs: Option<f64>,
+    /// Image-data end in seconds, if the caller anchored on the end side.
+    pub end_secs: Option<f64>,
+}
+
+impl DecodeWindow {
+    /// Anchor on the image's first line (or the transmission start just
+    /// before a VIS header).
+    #[must_use]
+    pub fn starting_at(start_secs: f64) -> Self {
+        Self {
+            start_secs: Some(start_secs),
+            end_secs: None,
+        }
+    }
+
+    /// Anchor on the last sample of the image *data* (the VIS header is not
+    /// counted). The start is derived from the mode's nominal image duration,
+    /// then refined by periodic sync-train acquisition; as with any
+    /// nominal-timing anchor, a transmitter clock error larger than about one
+    /// line can shift the top rows.
+    #[must_use]
+    pub fn ending_at(end_secs: f64) -> Self {
+        Self {
+            start_secs: None,
+            end_secs: Some(end_secs),
+        }
+    }
+}
+
 /// Internal state of the decoder.
 enum State {
     AwaitingVis,
@@ -105,26 +158,24 @@ enum State {
     Decoding(Box<DecodingState>),
 }
 
-/// Sub-phase of a forced-mode [`DecodingState`] (issue #113 follow-up).
+/// Sub-phase of a forced-mode [`DecodingState`] (issues #113/#114).
 ///
-/// Forced decoding has no VIS header to mark where an image begins, so it
-/// cannot chop the stream into fixed windows: a window boundary that lands in
-/// the middle of a transmission splits one image into two partial decodes, and
-/// a noisy window can fabricate an image from nothing. Instead the forced path
-/// first *searches* for a periodic sync train (a run of line-spaced 1200 Hz
-/// pulses) and only then collects a full window anchored on that train's line
-/// 0. `Searching` never emits; `Collecting` behaves like the VIS path.
+/// A forced window is located by the caller's `--start`/`--end` anchor, so the
+/// decoder never *searches* for where the image begins. `ManualProbe` probes
+/// the leading audio once for a VIS header purely to absorb it (so a
+/// transmission-start anchor does not count the header toward the image);
+/// when none is found the anchor itself is taken as line 0. `Collecting` then
+/// accumulates one image plus margin and decodes it.
 ///
 /// The VIS path always starts in `Collecting` (the VIS stop bit already marks
 /// line 0), so this phase is only consulted when [`SstvDecoder::forced_mode`]
 /// is set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ForcedPhase {
-    /// Scan for a periodic sync train; discard audio that can no longer begin
-    /// a train so an arbitrary-length gap stays bounded in memory.
-    Searching,
-    /// A train was found and the window is anchored on its line 0; accumulate
-    /// one full image plus margin, then decode.
+    /// Probe the leading audio once for a VIS header; absorb it if present,
+    /// otherwise take the anchor as line 0.
+    ManualProbe,
+    /// Accumulate one full image plus margin, then decode.
     Collecting,
 }
 
@@ -212,14 +263,12 @@ const FINDSYNC_AUDIO_HEADROOM: f64 = 1.00;
 /// [`SstvDecoder::with_mode`] / [`SstvDecoder::set_forced_mode`].
 const FORCED_MODE_TRAILING_MARGIN_SECONDS: f64 = 1.0;
 
-/// Minimum number of line-spaced sync pulses required before forced-mode
-/// decoding accepts a window as a real transmission (issue #113 follow-up).
-///
-/// A real image emits one sync pulse per radio line (>= 24 for every supported
-/// mode), so requiring four in a row on the line clock keeps the existing
-/// one-pulse Hough peak from turning noise, hum, or a lone tone into a
-/// fabricated image. See [`crate::sync::periodic_train_start`].
-const FORCED_MIN_SYNC_PULSES: usize = 4;
+/// Length of the leading audio probed for a VIS header when a manual window
+/// anchors on the start side (issue #114). A real VIS burst is ~0.6–0.9 s
+/// (leader + break + bits); 1.1 s covers it with slack. When the anchor is
+/// instead the image's first line this probe simply finds no header and the
+/// decoder takes the anchor as line 0.
+const MANUAL_VIS_PROBE_SECONDS: f64 = 1.1;
 
 /// Number of radio lines on the wire in one image of `spec`. PD packs two
 /// image rows per line; Robot and Scottie/Martin pack one.
@@ -305,12 +354,25 @@ pub struct SstvDecoder {
     ///
     /// Closes #29 and #34 (both are the same observation from different angles).
     working_samples_emitted: u64,
-    /// When `Some`, VIS detection is bypassed: every full image window is
-    /// decoded as this mode (issue #113). Set at construction via
-    /// [`SstvDecoder::with_mode`] or at runtime via
-    /// [`SstvDecoder::set_forced_mode`]. `None` restores automatic VIS
-    /// detection.
+    /// When `Some`, VIS detection is bypassed and exactly one image is decoded
+    /// as this mode, located by the forced window (issue #113/#114).
+    /// Set at construction via [`SstvDecoder::with_mode`] or at
+    /// runtime via [`SstvDecoder::set_forced_mode`]; cleared via
+    /// [`SstvDecoder::clear_forced_mode`]. `None` restores automatic VIS
+    /// detection. Always `Some`/`None` in lock-step with `forced_window`.
     forced_mode: Option<SstvMode>,
+    /// The caller-specified window for the forced mode (issue #114). Always
+    /// `Some` exactly when [`Self::forced_mode`] is `Some`.
+    forced_window: Option<DecodeWindow>,
+    /// `true` once the single manual-window image has been attempted, so
+    /// subsequent audio is ignored.
+    manual_done: bool,
+    /// Input-rate samples still to discard before feeding the resampler;
+    /// positions the manual window's anchor.
+    manual_skip_input: u64,
+    /// Maximum number of input-rate samples to feed after the anchor. Bounds
+    /// the manual search so a wrong anchor cannot drift onto a later image.
+    manual_feed_budget: Option<u64>,
 }
 
 impl SstvDecoder {
@@ -330,53 +392,123 @@ impl SstvDecoder {
             samples_processed: 0,
             working_samples_emitted: 0,
             forced_mode: None,
+            forced_window: None,
+            manual_done: false,
+            manual_skip_input: 0,
+            manual_feed_budget: None,
         })
     }
 
-    /// Construct a decoder that decodes every image as `mode`, bypassing
-    /// automatic VIS header detection (issue #113).
+    /// Construct a forced-mode decoder restricted to a [`DecodeWindow`]
+    /// (issues #113/#114).
     ///
-    /// Use this when the VIS header is missing, damaged, or misdetected, or
-    /// when batch-processing recordings of a known mode.
+    /// This is the **only** way to force a mode: a forced mode always carries
+    /// a window, so there is no "scan the whole stream" entry point. It decodes
+    /// **one** image located by the caller:
     ///
-    /// Decoding does not begin blindly at the start of the audio: forced mode
-    /// first *acquires* a transmission by scanning for a run of several
-    /// line-spaced 1200 Hz sync pulses, then anchors the decode window on
-    /// line 0 and decodes one full image. Audio
-    /// before the train (lead-in silence, a stray VIS header, an inter-image
-    /// gap) is skipped, and audio that can no longer begin a train is discarded
-    /// so arbitrarily long gaps stay bounded in memory. This means a recording
-    /// holding several transmissions separated by silence yields one aligned
-    /// image per transmission, and noise or a lone tone does not fabricate an
-    /// image.
+    /// * [`DecodeWindow::starting_at`] anchors on the image's first line or
+    ///   on the transmission start. If a VIS header begins at the anchor it
+    ///   is detected and absorbed (its duration is skipped) so the visible
+    ///   image is not shifted; if no usable header is present the anchor
+    ///   itself is taken as line 0.
+    /// * [`DecodeWindow::ending_at`] anchors on the image-data end; the start
+    ///   is `end − nominal image duration`.
     ///
-    /// Because no VIS is parsed, no [`SstvEvent::VisDetected`] event is emitted
-    /// and the radio-mistuning offset (`hedr_shift_hz`) is treated as zero.
-    /// A transmission that starts before the recording does (the capture
-    /// catches only its tail) is decoded from the first acquired line.
+    /// The decode length is always the mode's **nominal image duration**
+    /// (VIS not counted), so only one endpoint is needed. The decoder does
+    /// **not** search for where the image begins: the anchor is authoritative
+    /// (after an optional VIS absorption). After this image is attempted the
+    /// decoder stops.
+    ///
+    /// The window's sync gate still applies: a window with no detectable sync
+    /// pulses yields no image. No [`SstvEvent::VisDetected`] is emitted even
+    /// when a header is absorbed (the forced mode, not the header, selects the
+    /// mode), and `hedr_shift_hz` is treated as zero.
     ///
     /// # Errors
     /// Returns [`crate::Error::InvalidSampleRate`] if the rate is 0 or
     /// > [`crate::resample::MAX_INPUT_SAMPLE_RATE_HZ`].
-    pub fn with_mode(input_sample_rate_hz: u32, mode: SstvMode) -> Result<Self> {
+    pub fn with_mode(
+        input_sample_rate_hz: u32,
+        mode: SstvMode,
+        window: DecodeWindow,
+    ) -> Result<Self> {
         let mut decoder = Self::new(input_sample_rate_hz)?;
         decoder.forced_mode = Some(mode);
+        decoder.forced_window = Some(window);
+        decoder.refresh_manual_window();
         Ok(decoder)
     }
 
-    /// Set or clear the forced-decoding mode.
+    /// Set the forced mode and its [`DecodeWindow`] together, discarding any
+    /// in-flight image.
     ///
-    /// Passing `Some(mode)` bypasses VIS detection and decodes subsequent
-    /// images as `mode`; `None` restores automatic VIS detection. Any
-    /// in-flight image is discarded and the change takes effect on the next
-    /// [`Self::process`] call. Sample counters and the resampler state are
-    /// preserved (use [`Self::reset`] to clear those too).
-    pub fn set_forced_mode(&mut self, mode: Option<SstvMode>) {
-        self.forced_mode = mode;
+    /// Both are required: a forced mode without a window is not a supported
+    /// state. Use [`Self::clear_forced_mode`] to return to automatic VIS
+    /// detection.
+    pub fn set_forced_mode(&mut self, mode: SstvMode, window: DecodeWindow) {
+        self.forced_mode = Some(mode);
+        self.forced_window = Some(window);
         // Discard any in-flight image and restart detection with a fresh
         // detector (honors the `#40` re-anchor contract).
         self.state = State::AwaitingVis;
         self.vis = crate::vis::VisDetector::new(IS_KNOWN_VIS);
+        self.refresh_manual_window();
+    }
+
+    /// Clear the forced mode and window, restoring automatic VIS detection.
+    /// Any in-flight image is discarded.
+    pub fn clear_forced_mode(&mut self) {
+        self.forced_mode = None;
+        self.forced_window = None;
+        self.state = State::AwaitingVis;
+        self.vis = crate::vis::VisDetector::new(IS_KNOWN_VIS);
+        self.refresh_manual_window();
+    }
+
+    /// The manual decode window, if one is set.
+    #[must_use]
+    pub fn decode_window(&self) -> Option<DecodeWindow> {
+        self.forced_window
+    }
+
+    /// Recompute the manual-window input skip/budget from the current forced
+    /// mode + window. Called whenever either changes so `process` only has to
+    /// apply precomputed counters.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn refresh_manual_window(&mut self) {
+        self.manual_done = false;
+        self.manual_skip_input = 0;
+        self.manual_feed_budget = None;
+        let (Some(mode), Some(window)) = (self.forced_mode, self.forced_window) else {
+            return;
+        };
+        let image_secs = nominal_image_seconds(crate::modespec::for_mode(mode));
+        // `start_secs` is authoritative; with only `end_secs` the anchor is
+        // one image back from the image-data end (VIS not counted).
+        let anchor_secs = match (window.start_secs, window.end_secs) {
+            (Some(start), _) => start,
+            (None, Some(end)) => (end - image_secs).max(0.0),
+            (None, None) => {
+                // Malformed window: clear the forced mode rather than leave
+                // the (mode, window) invariant broken.
+                self.forced_mode = None;
+                self.forced_window = None;
+                return;
+            }
+        };
+        let anchor_secs = anchor_secs.max(0.0);
+        let input_rate = f64::from(self.resampler.input_rate());
+        let anchor_input = (anchor_secs * input_rate).round() as u64;
+        self.manual_skip_input = anchor_input.saturating_sub(self.samples_processed);
+        // Allow a VIS header + one image + trailing margin after the anchor.
+        let budget_secs =
+            MANUAL_VIS_PROBE_SECONDS + image_secs + FORCED_MODE_TRAILING_MARGIN_SECONDS;
+        self.manual_feed_budget = Some((budget_secs * input_rate).round() as u64);
     }
 
     /// The mode forced for decoding, if any. `None` means automatic VIS
@@ -399,8 +531,25 @@ impl SstvDecoder {
         clippy::too_many_lines
     )]
     pub fn process(&mut self, audio: &[f32]) -> Vec<SstvEvent> {
-        let working = self.resampler.process(audio);
         self.samples_processed = self.samples_processed.saturating_add(audio.len() as u64);
+
+        // Manual window (issue #114): drop everything before the anchor, then
+        // hard-cap the feed at one image's worth so a wrong anchor cannot
+        // drift forward onto a later transmission. Both counters are inert
+        // (zero / `None`) unless a window is set.
+        let mut feed: &[f32] = audio;
+        if self.manual_skip_input > 0 {
+            let drop = (self.manual_skip_input as usize).min(feed.len());
+            feed = &feed[drop..];
+            self.manual_skip_input -= drop as u64;
+        }
+        if let Some(budget) = self.manual_feed_budget.as_mut() {
+            let take = (*budget as usize).min(feed.len());
+            feed = &feed[..take];
+            *budget -= take as u64;
+        }
+
+        let working = self.resampler.process(feed);
         self.working_samples_emitted = self
             .working_samples_emitted
             .saturating_add(working.len() as u64);
@@ -410,17 +559,25 @@ impl SstvDecoder {
         loop {
             match &mut self.state {
                 State::AwaitingVis => {
-                    // Forced mode (issue #113) bypasses VIS detection
-                    // entirely. It begins in the `Searching` phase: no image
-                    // window is committed until a periodic sync train is
-                    // found, so gaps between transmissions (and lead-in
-                    // silence/headers) neither split an image across window
-                    // boundaries nor fabricate one from noise. Mistuning is
-                    // unknown without a VIS, so it is treated as zero.
+                    // Forced mode always carries a window (issue #114) and
+                    // anchors at the caller's position. `ManualProbe` probes
+                    // once for a VIS header to absorb; the anchor is otherwise
+                    // authoritative (no search for where the image begins).
+                    // Once its single image has been attempted the decoder
+                    // stops. Mistuning is unknown without a VIS, so it is
+                    // treated as zero.
                     if let Some(mode) = self.forced_mode {
+                        if self.manual_done {
+                            break;
+                        }
                         let spec = crate::modespec::for_mode(mode);
-                        self.state =
-                            Self::start_decoding(spec, 0.0, Vec::new(), 0, ForcedPhase::Searching);
+                        self.state = Self::start_decoding(
+                            spec,
+                            0.0,
+                            Vec::new(),
+                            0,
+                            ForcedPhase::ManualProbe,
+                        );
                         continue;
                     }
                     self.vis.process(remaining, self.working_samples_emitted);
@@ -502,74 +659,37 @@ impl SstvDecoder {
                         d.next_probe_sample += SYNC_PROBE_STRIDE;
                     }
 
-                    // Forced-mode acquisition (issue #113 follow-up). Before
-                    // committing to a decode window, require a periodic sync
-                    // train so a fixed window boundary cannot split one image
-                    // in two (or fabricate an image from noise). Once a train
-                    // is found, trim the buffer so it begins on line 0's *start*
-                    // and switch to collecting a full image.
-                    if forced && d.phase == ForcedPhase::Searching {
+                    // Forced window (issue #114): probe the leading audio once
+                    // for a VIS header. A real header marks the image's start
+                    // as its stop-bit end, so the header is absorbed (not
+                    // counted toward the image length). When no header is
+                    // present, the caller's anchor itself is taken as line 0 —
+                    // the decoder does not search for where the image begins.
+                    if forced && d.phase == ForcedPhase::ManualProbe {
                         let work_rate = f64::from(crate::resample::WORKING_SAMPLE_RATE_HZ);
-                        // Probes to back up from a pulse's leading edge to
-                        // line 0's start (mid-line for Scottie), plus one probe
-                        // of leading margin so the first pixel window has
-                        // context. Whole probes keep `has_sync` aligned with
-                        // `audio`.
-                        let lead_probes = ((d.spec.sync_lead_offset_seconds() * work_rate)
-                            / (SYNC_PROBE_STRIDE as f64))
-                            .ceil() as usize;
-                        if let Some(anchor_probe) = periodic_train_start(
-                            &d.has_sync,
-                            work_rate,
-                            d.spec,
-                            FORCED_MIN_SYNC_PULSES,
-                        ) {
-                            // Anchor on line 0's start: back up from the first
-                            // pulse past the sync's within-line position, drop
-                            // the leading silence/header, then size the window
-                            // to one image plus a small trailing margin.
-                            let drain_probes =
-                                anchor_probe.saturating_sub(lead_probes).saturating_sub(1);
-                            let anchor = drain_probes * SYNC_PROBE_STRIDE;
-                            d.audio.drain(0..anchor);
-                            d.has_sync.drain(0..drain_probes);
-                            d.next_probe_sample = d.next_probe_sample.saturating_sub(anchor);
-                            let nominal_samples =
-                                (nominal_image_seconds(d.spec) * work_rate) as usize;
-                            let margin_samples =
-                                (FORCED_MODE_TRAILING_MARGIN_SECONDS * work_rate) as usize;
-                            d.target_audio_samples = nominal_samples + margin_samples;
-                            d.phase = ForcedPhase::Collecting;
-                        } else {
-                            // No train yet. Drop the prefix that can no longer
-                            // begin one (a start at probe `i` is decided once
-                            // probes through `i + (min_pulses-1)*period + tol`
-                            // exist and it did not qualify), keeping the
-                            // retained tail long enough to catch a train that
-                            // straddles the drop boundary. `lead_probes` extra
-                            // is retained so a future train's pre-sync line-0
-                            // content (Scottie) is not discarded. This bounds
-                            // memory over arbitrarily long gaps.
-                            let period = (d.spec.line_seconds * work_rate
-                                / (SYNC_PROBE_STRIDE as f64))
-                                .round() as usize;
-                            if period > 0 {
-                                let decided_after = (FORCED_MIN_SYNC_PULSES - 1) * period + 2;
-                                let drop_probes = d
-                                    .has_sync
-                                    .len()
-                                    .saturating_sub(decided_after)
-                                    .saturating_sub(lead_probes);
-                                if drop_probes > 0 {
-                                    let drop_samples = drop_probes * SYNC_PROBE_STRIDE;
-                                    d.audio.drain(0..drop_samples);
-                                    d.has_sync.drain(0..drop_probes);
-                                    d.next_probe_sample =
-                                        d.next_probe_sample.saturating_sub(drop_samples);
-                                }
-                            }
-                            break; // need more audio to find a train
+                        let probe_len = (MANUAL_VIS_PROBE_SECONDS * work_rate) as usize;
+                        if d.audio.len() < probe_len {
+                            break; // need a full probe window
                         }
+                        let mut det = crate::vis::VisDetector::new(IS_KNOWN_VIS);
+                        det.process(&d.audio[..probe_len], probe_len as u64);
+                        if let Some(detected) = det.take_detected() {
+                            // Drain a whole number of probes so `has_sync`
+                            // stays aligned with `audio`.
+                            let drain_probes = ((detected.end_sample as usize) / SYNC_PROBE_STRIDE)
+                                .min(d.has_sync.len());
+                            let drain = drain_probes * SYNC_PROBE_STRIDE;
+                            d.audio.drain(0..drain);
+                            d.has_sync.drain(0..drain_probes);
+                            d.next_probe_sample = d
+                                .next_probe_sample
+                                .saturating_sub(drain_probes * SYNC_PROBE_STRIDE);
+                        }
+                        let nominal_samples = (nominal_image_seconds(d.spec) * work_rate) as usize;
+                        let margin_samples =
+                            (FORCED_MODE_TRAILING_MARGIN_SECONDS * work_rate) as usize;
+                        d.target_audio_samples = nominal_samples + margin_samples;
+                        d.phase = ForcedPhase::Collecting;
                     }
 
                     if d.audio.len() < d.target_audio_samples {
@@ -581,9 +701,7 @@ impl SstvDecoder {
                     // moving `d` into `run_findsync_and_decode` (which consumes
                     // it by value so `d.image` can move directly into the
                     // `ImageComplete` event without a fresh black-image
-                    // realloc — Audit #93 D6.2). Forced mode instead re-seeds
-                    // on the exact audio after the decoded image, returned by
-                    // `run_findsync_and_decode`.
+                    // realloc — Audit #93 D6.2).
                     let carry_audio: Vec<f32> = if forced {
                         Vec::new()
                     } else {
@@ -603,7 +721,7 @@ impl SstvDecoder {
                     else {
                         unreachable!("outer match arm is Decoding");
                     };
-                    let forced_tail = Self::run_findsync_and_decode(
+                    Self::run_findsync_and_decode(
                         *d_box,
                         &mut self.channel_demod,
                         &mut self.snr_est,
@@ -613,21 +731,10 @@ impl SstvDecoder {
                     );
 
                     if forced {
-                        // Resume searching for the next transmission. The tail
-                        // after this image (empty if the caller feeds more in a
-                        // later `process` call) is re-seeded into a fresh
-                        // `Searching` window, which re-probes it and waits for
-                        // the next periodic sync train.
-                        if let Some(mode) = self.forced_mode {
-                            let spec = crate::modespec::for_mode(mode);
-                            self.state = Self::start_decoding(
-                                spec,
-                                0.0,
-                                forced_tail.unwrap_or_default(),
-                                0,
-                                ForcedPhase::Searching,
-                            );
-                        }
+                        // Forced mode is a one-shot window (issue #114): stop
+                        // after the single image. `AwaitingVis` observes
+                        // `manual_done` and breaks.
+                        self.manual_done = true;
                     } else {
                         // Image complete. Re-arm VIS detection in place (no
                         // `break`! — the loop re-iterates into `AwaitingVis`) — a
@@ -675,9 +782,8 @@ impl SstvDecoder {
     /// Build the [`State::Decoding`] for `spec` with `residual` already
     /// buffered and a total `target_audio_samples` window. Shared by the VIS
     /// path (residual = post-stop-bit audio, phase = `Collecting`) and the
-    /// forced-mode path (residual = empty or the previous image's tail, phase =
-    /// `Searching` or `Collecting`). `target_audio_samples` is ignored while
-    /// `phase` is `Searching` (the window is sized when a train is found).
+    /// forced-mode path (residual = empty, phase = `ManualProbe`, which sizes
+    /// the window once the one-shot VIS probe resolves).
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn start_decoding(
         spec: crate::modespec::ModeSpec,
@@ -752,51 +858,24 @@ impl SstvDecoder {
         find_sync_scratch: &mut crate::sync::FindSyncScratch,
         out: &mut Vec<SstvEvent>,
         forced: bool,
-    ) -> Option<Vec<f32>> {
+    ) {
         let work_rate = f64::from(crate::resample::WORKING_SAMPLE_RATE_HZ);
-        // `find_sync` walks `image_lines` line periods, which for PD modes
-        // spans *two* images (PD packs two image rows per radio line). When the
-        // buffer carries audio past the current image (a large single `process`
-        // call, or a gap before the next transmission) that second-image sync
-        // train — at a different phase — would corrupt the falling-edge search.
-        // Restrict forced mode to the collected window's sync track; the decode
-        // still uses the full `d.audio` for its trailing lookahead.
-        let sync_track: &[bool] = if forced {
-            let window_probes = (d.target_audio_samples / SYNC_PROBE_STRIDE).min(d.has_sync.len());
-            &d.has_sync[..window_probes]
-        } else {
-            &d.has_sync
-        };
-        let result = find_sync(sync_track, work_rate, d.spec, find_sync_scratch);
+        let result = find_sync(&d.has_sync, work_rate, d.spec, find_sync_scratch);
         let rate = result.adjusted_rate_hz;
         // A Hough peak means at least some sync pulses registered. In VIS mode
-        // this is informational; in forced mode it gates emission so a window
-        // of silence does not produce a black "image".
+        // this is informational; in a forced window it gates emission so a
+        // window of silence does not produce a black "image".
         let sync_found = result.slant_deg.is_some();
-
         if forced && !sync_found {
-            // Forced mode on a sync-less window (silence, noise, or trailing
-            // padding): emit nothing and advance by one full window so the
-            // loop makes progress instead of re-scanning the same audio.
-            let start = d.target_audio_samples.min(d.audio.len());
-            return Some(d.audio[start..].to_vec());
+            // Forced window on a sync-less window (silence, noise, or trailing
+            // padding): emit nothing. The one-shot decoder then stops.
+            return;
         }
 
-        // Forced mode starts at the stream origin, so a leading VIS header or
-        // lead-in silence aliases `find_sync`'s line-relative skip by whole
-        // lines; recover the absolute line-0 offset from the first periodic
-        // sync pulse. VIS mode already starts at the stop bit, so it needs no
-        // correction.
-        let skip = if forced {
-            crate::sync::absolute_skip_from_first_sync(
-                result.skip_samples,
-                sync_track,
-                rate,
-                d.spec,
-            )
-        } else {
-            result.skip_samples
-        };
+        // The VIS path starts at the stop bit and a forced window at the
+        // caller's anchor (after any absorbed VIS header), so `find_sync`'s
+        // line-relative skip is already relative to line 0 for both.
+        let skip = result.skip_samples;
 
         // Image-complete burst: image_lines LineDecoded events + 1 ImageComplete.
         // Pre-reserve to avoid Vec growth reallocs. (Audit #93 D5.)
@@ -909,22 +988,11 @@ impl SstvDecoder {
             image: d.image,
             partial: false,
         });
-
-        // Forced mode: return the audio after this image so the caller can
-        // seed the next window. VIS mode re-arms via its carryback and
-        // returns `None`.
-        if forced {
-            let image_end = skip + (nominal_image_seconds(d.spec) * rate).round() as i64;
-            let start = image_end.clamp(0, d.audio.len() as i64) as usize;
-            Some(d.audio[start..].to_vec())
-        } else {
-            None
-        }
     }
 
     /// Reset to `AwaitingVis`; discard any in-flight image. The forced-decoding
-    /// mode (if one is set via [`Self::with_mode`] / [`Self::set_forced_mode`])
-    /// is preserved.
+    /// mode + window (if set via [`Self::with_mode`] /
+    /// [`Self::set_forced_mode`]) is preserved.
     pub fn reset(&mut self) {
         self.state = State::AwaitingVis;
         self.samples_processed = 0;
@@ -933,6 +1001,7 @@ impl SstvDecoder {
         self.resampler.reset_state();
         self.channel_demod = crate::demod::ChannelDemod::new();
         self.snr_est = crate::snr::SnrEstimator::new();
+        self.refresh_manual_window();
     }
 
     /// Total samples processed since construction (or last `reset`).
@@ -950,6 +1019,7 @@ impl std::fmt::Debug for SstvDecoder {
             .field("samples_processed", &self.samples_processed)
             .field("working_samples_emitted", &self.working_samples_emitted)
             .field("forced_mode", &self.forced_mode)
+            .field("forced_window", &self.forced_window)
             .finish_non_exhaustive()
     }
 }

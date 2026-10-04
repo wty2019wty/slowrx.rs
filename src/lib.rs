@@ -65,7 +65,7 @@ pub(crate) mod robot_test_encoder;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) mod scottie_test_encoder;
 
-pub use crate::decoder::{SstvDecoder, SstvEvent};
+pub use crate::decoder::{DecodeWindow, SstvDecoder, SstvEvent};
 pub use crate::error::{Error, Result};
 pub use crate::image::SstvImage;
 pub use crate::modespec::{

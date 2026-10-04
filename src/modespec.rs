@@ -139,25 +139,6 @@ impl ModeSpec {
             }
         }
     }
-
-    /// Offset (seconds) from line start to the leading edge of that line's
-    /// sync pulse.
-    ///
-    /// `LineStart` modes put the sync at line start (0). Scottie's sync sits
-    /// mid-line, after the B channel, at `2·septr + 2·chan_len` (the same
-    /// offset `mode_scottie` uses for the R channel start minus sync+porch).
-    /// Used by forced-mode acquisition to anchor a decode window on line 0
-    /// rather than on the sync pulse (issue #113 follow-up).
-    #[must_use]
-    pub(crate) fn sync_lead_offset_seconds(&self) -> f64 {
-        match self.sync_position {
-            SyncPosition::LineStart => 0.0,
-            SyncPosition::Scottie => {
-                let chan_len = f64::from(self.line_pixels) * self.pixel_seconds;
-                2.0 * self.septr_seconds + 2.0 * chan_len
-            }
-        }
-    }
 }
 
 /// Look up the [`ModeSpec`] for a given 7-bit VIS code. Returns `None`
@@ -748,41 +729,6 @@ mod tests {
                 spec.skip_correction_seconds() < 0.0,
                 "{mode:?} Scottie correction should be negative"
             );
-        }
-    }
-
-    #[test]
-    fn sync_lead_offset_seconds_line_start_is_zero() {
-        for mode in [
-            SstvMode::Pd120,
-            SstvMode::Pd240,
-            SstvMode::Pd180,
-            SstvMode::Robot24,
-            SstvMode::Robot36,
-            SstvMode::Robot72,
-            SstvMode::Martin1,
-            SstvMode::Martin2,
-        ] {
-            assert_eq!(
-                for_mode(mode).sync_lead_offset_seconds(),
-                0.0,
-                "{mode:?} syncs at line start"
-            );
-        }
-    }
-
-    #[test]
-    fn sync_lead_offset_seconds_scottie_formula() {
-        for mode in [SstvMode::Scottie1, SstvMode::Scottie2, SstvMode::ScottieDx] {
-            let spec = for_mode(mode);
-            let chan_len = f64::from(spec.line_pixels) * spec.pixel_seconds;
-            let expected = 2.0 * spec.septr_seconds + 2.0 * chan_len;
-            assert!(
-                (spec.sync_lead_offset_seconds() - expected).abs() < 1e-12,
-                "{mode:?} got {} expected {expected}",
-                spec.sync_lead_offset_seconds()
-            );
-            assert!(spec.sync_lead_offset_seconds() > 0.0);
         }
     }
 

@@ -4,7 +4,8 @@
 //!
 //! ```text
 //! slowrx-cli --input recording.wav --output ./out
-//! slowrx-cli --input recording.wav --output ./out --mode pd120
+//! slowrx-cli --input recording.wav --output ./out --mode robot36 --start 12.5
+//! slowrx-cli --input recording.wav --output ./out --mode robot36 --end 48.5
 //! slowrx-cli --list-modes
 //! ```
 //!
@@ -13,9 +14,12 @@
 //! (sequence-numbered starting at 001, lowercased mode tag — matches the
 //! rtl-sdr satellite-recorder naming convention).
 //!
-//! Pass `--mode <MODE>` to force decoding as a known mode, bypassing
-//! automatic VIS header detection (issue #113). `--list-modes` prints the
-//! accepted names.
+//! Pass `--mode <MODE>` together with `--start <SECONDS>` or
+//! `--end <SECONDS>` to force decoding of one image at a known time,
+//! bypassing automatic VIS header detection (issues #113/#114). A forced
+//! mode always requires a time anchor; there is no whole-stream scan mode.
+//! The decode length comes from the mode's nominal image duration and the
+//! VIS header is not counted. `--list-modes` prints the accepted names.
 //!
 //! Requires the `cli` feature: `cargo install --features cli`.
 
@@ -23,14 +27,20 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use slowrx::{SstvDecoder, SstvEvent, SstvImage};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "slowrx-cli",
     version,
-    about = "Decode SSTV recordings (WAV) to PNG images"
+    about = "Decode SSTV recordings (WAV) to PNG images",
+    group(
+        ArgGroup::new("window")
+            .args(["start", "end"])
+            .multiple(false)
+            .required(false)
+    )
 )]
 struct Args {
     /// Path to a mono or multi-channel WAV file containing SSTV audio.
@@ -58,11 +68,25 @@ struct Args {
     quiet: bool,
 
     /// Force decoding as MODE, bypassing automatic VIS header detection.
-    /// Accepts a short name (e.g. `pd120`, `robot36`) or display name
-    /// (e.g. `PD-120`, `Robot 36`), case-insensitively. Use `--list-modes`
-    /// to see the accepted names.
-    #[arg(short = 'm', long, value_name = "MODE")]
+    /// Requires `--start` or `--end` to locate the image. Accepts a short
+    /// name (e.g. `pd120`, `robot36`) or display name (e.g. `PD-120`,
+    /// `Robot 36`), case-insensitively. Use `--list-modes` to see the
+    /// accepted names.
+    #[arg(short = 'm', long, value_name = "MODE", requires = "window")]
     mode: Option<String>,
+
+    /// Decode a single image starting at this time (seconds from the start
+    /// of the recording). Requires --mode. The decode length comes from the
+    /// mode's nominal image duration; the anchor may point at the
+    /// transmission start (VIS header) or the image's first line.
+    #[arg(long, value_name = "SECONDS", requires = "mode")]
+    start: Option<f64>,
+
+    /// Decode a single image whose data ends at this time (seconds from the
+    /// start of the recording). Requires --mode. The start is derived from
+    /// the mode's nominal image duration (the VIS header is not counted).
+    #[arg(long, value_name = "SECONDS", requires = "mode")]
+    end: Option<f64>,
 
     /// List the supported modes and exit.
     #[arg(long)]
@@ -131,15 +155,39 @@ fn run(args: &Args) -> Result<u32> {
         })?),
         None => None,
     };
-    let mut decoder = match forced_mode {
-        Some(mode) => SstvDecoder::with_mode(spec.sample_rate, mode)
-            .with_context(|| "construct forced-mode SstvDecoder")?,
-        None => SstvDecoder::new(spec.sample_rate).with_context(|| "construct SstvDecoder")?,
+    if let Some(t) = args.start {
+        if t < 0.0 {
+            bail!("--start must be non-negative seconds, got {t}");
+        }
+    }
+    if let Some(t) = args.end {
+        if t < 0.0 {
+            bail!("--end must be non-negative seconds, got {t}");
+        }
+    }
+    // clap's `window` group guarantees at most one of start/end.
+    let forced_window = match (args.start, args.end) {
+        (Some(start), _) => Some(slowrx::DecodeWindow::starting_at(start)),
+        (None, Some(end)) => Some(slowrx::DecodeWindow::ending_at(end)),
+        (None, None) => None,
     };
-    if let Some(mode) = forced_mode {
+    let mut decoder = match (forced_mode, forced_window) {
+        (Some(mode), Some(window)) => SstvDecoder::with_mode(spec.sample_rate, mode, window)
+            .with_context(|| "construct forced-mode SstvDecoder")?,
+        (None, None) => {
+            SstvDecoder::new(spec.sample_rate).with_context(|| "construct SstvDecoder")?
+        }
+        _ => bail!("--mode requires --start or --end to locate the image"),
+    };
+    if let (Some(mode), Some(window)) = (forced_mode, forced_window) {
         if !args.quiet {
+            let anchor = match (window.start_secs, window.end_secs) {
+                (Some(s), _) => format!("start={s:.3}s"),
+                (None, Some(e)) => format!("end={e:.3}s"),
+                (None, None) => "invalid".to_owned(),
+            };
             eprintln!(
-                "forced mode: {} (VIS detection bypassed, issue #113)",
+                "forced mode: {} ({anchor}, VIS detection bypassed, issue #113/#114)",
                 slowrx::for_mode(mode).name
             );
         }

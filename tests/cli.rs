@@ -76,8 +76,8 @@ fn cli_list_modes_prints_table() {
     assert!(stdout.contains("PD-120"), "stdout: {stdout}");
 }
 
-/// End-to-end: force a mode on a VIS-less synthetic PD120 WAV and check the
-/// PNG comes out under the forced mode's filename (issue #113).
+/// End-to-end: `--start` and `--end` restrict forced decoding to a single
+/// image (issue #114). Uses a short Robot 36 image so the test stays quick.
 #[cfg(feature = "test-support")]
 #[test]
 #[allow(
@@ -85,30 +85,27 @@ fn cli_list_modes_prints_table() {
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
 )]
-fn cli_mode_flag_decodes_vis_less_wav() {
+fn cli_window_flags_decode_robot36() {
     use slowrx::{SstvMode, WORKING_SAMPLE_RATE_HZ};
 
-    // Synthetic PD120 image (same shape as other tests).
-    let spec = slowrx::for_mode(SstvMode::Pd120);
+    let spec = slowrx::for_mode(SstvMode::Robot36);
     let (w, h) = (spec.line_pixels, spec.image_lines);
     let mut ycrcb = Vec::with_capacity((w * h) as usize);
     for y in 0..h {
         for x in 0..w {
             let lum = ((f64::from(x)) / (f64::from(w)) * 255.0) as u8;
             let cr = if y % 4 < 2 { 200 } else { 56 };
-            let cb = if (y / 2) % 2 == 0 { 200 } else { 56 };
+            let cb = if (y + 1) % 4 < 2 { 200 } else { 56 };
             ycrcb.push([lum, cr, cb]);
         }
     }
-    // No VIS header: exactly what forced mode exists for.
-    let mut audio = slowrx::__test_support::mode_pd::encode_pd(SstvMode::Pd120, &ycrcb);
-    // Clear the resampler group delay + the one-second forced-mode preroll.
+    let mut audio = slowrx::__test_support::mode_robot::encode_robot(SstvMode::Robot36, &ycrcb);
     audio.extend(std::iter::repeat_n(
         0.0_f32,
         WORKING_SAMPLE_RATE_HZ as usize + 4096,
     ));
 
-    let dir = std::env::temp_dir().join(format!("slowrx-cli-mode-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("slowrx-cli-window-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("create temp dir");
     let wav = dir.join("input.wav");
@@ -128,24 +125,48 @@ fn cli_mode_flag_decodes_vis_less_wav() {
         writer.finalize().expect("finalize WAV");
     }
 
-    let out_dir = dir.join("out");
+    let nominal = f64::from(h) * spec.line_seconds;
+    let end_value = format!("{nominal}");
+    for (label, flag, value) in [
+        ("start", "--start", "0.0"),
+        ("end", "--end", end_value.as_str()),
+    ] {
+        let out_dir = dir.join(format!("out-{label}"));
+        Command::cargo_bin("slowrx-cli")
+            .expect("binary built")
+            .arg("--input")
+            .arg(&wav)
+            .arg("--output")
+            .arg(&out_dir)
+            .arg("--mode")
+            .arg("robot36")
+            .arg(flag)
+            .arg(value)
+            .arg("--quiet")
+            .assert()
+            .success();
+        assert!(
+            out_dir.join("img-001-robot36.png").is_file(),
+            "expected img-001-robot36.png for {flag} in {}",
+            out_dir.display()
+        );
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `--mode` without `--start`/`--end` must be rejected: a forced mode always
+/// requires a time anchor (issue #114 follow-up).
+#[test]
+fn cli_mode_requires_window_flag() {
     Command::cargo_bin("slowrx-cli")
         .expect("binary built")
         .arg("--input")
-        .arg(&wav)
+        .arg("missing.wav")
         .arg("--output")
-        .arg(&out_dir)
+        .arg("out")
         .arg("--mode")
-        .arg("PD-120")
-        .arg("--quiet")
+        .arg("pd120")
         .assert()
-        .success();
-
-    assert!(
-        out_dir.join("img-001-pd120.png").is_file(),
-        "expected img-001-pd120.png in {}",
-        out_dir.display()
-    );
-
-    let _ = fs::remove_dir_all(&dir);
+        .failure();
 }

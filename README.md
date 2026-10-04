@@ -64,28 +64,38 @@ slowrx-cli --input recording.wav --output ./out
 # → out/img-001-pd120.png, out/img-002-robot36.png, ...
 ```
 
-When the VIS header is missing or damaged (or to force a mode you already
-know), bypass automatic detection:
+When the VIS header is missing or damaged (or to decode a mode you already
+know), force the mode and a decode window:
 
 ```rust
-use slowrx::{SstvDecoder, SstvMode};
+use slowrx::{DecodeWindow, SstvDecoder, SstvMode};
 
-// Decode every image as PD-120, ignoring VIS.
-let mut decoder = SstvDecoder::with_mode(44_100, SstvMode::Pd120)
-    .expect("valid sample rate");
+// Decode the image whose first line (or transmission start) is at 12.5 s.
+let mut decoder = SstvDecoder::with_mode(
+    44_100,
+    SstvMode::Robot36,
+    DecodeWindow::starting_at(12.5),
+)
+.expect("valid sample rate");
 ```
 
 ```bash
-slowrx-cli --input recording.wav --output ./out --mode pd120
+# One image starting at 12.5 s (absorbs a VIS header if one is there).
+slowrx-cli --input recording.wav --output ./out --mode robot36 --start 12.5
+# One image whose *data* ends at 48.5 s (length from the mode's nominal 36 s).
+slowrx-cli --input recording.wav --output ./out --mode robot36 --end 48.5
 slowrx-cli --list-modes
 ```
 
-`--mode` accepts a short name (`pd120`, `robot36`) or display name
-(`PD-120`, `Robot 36`), case-insensitively. A forced decoder acquires each
-transmission from its periodic sync-pulse train instead of a VIS stop bit, so a
-recording holding several transmissions separated by silence yields one
-line-0-aligned image each, and sync-less noise or a lone tone does not
-fabricate an image. See the `SstvDecoder::with_mode` docs for details.
+A forced mode **always** requires `--start` or `--end` (there is no
+whole-stream scan mode). `--mode` accepts a short name (`pd120`, `robot36`) or
+display name (`PD-120`, `Robot 36`), case-insensitively. The decode length is
+the mode's nominal image duration (the VIS header is not counted), so only one
+endpoint is needed. A VIS header beginning at a `--start` anchor is detected
+and absorbed; if it is missing the anchor itself is taken as the image start
+(the decoder does not search for where the image begins). The sync gate still
+applies (a window with no sync pulses yields no image), and decoding stops
+after that one image. See the `SstvDecoder::with_mode` docs for details.
 
 ## What it does
 
